@@ -1,46 +1,116 @@
-import { Context, Schema } from 'koishi'
-import { CronExpression, parseExpression } from 'cron-parser'
+import { Context, Disposable, Schema } from 'koishi';
+import { CronExpression, CronExpressionParser } from 'cron-parser';
+
+export const name = 'cron';
+export const inject = {
+  implements: ['cron'] as const,
+};
+export const reusable = false
+export const filter = false
+
+export type CronCallback = () => void | Promise<void>;
+
+export type Cron = (this: Context, input: string, callback: CronCallback) => () => void;
 
 declare module 'koishi' {
   interface Context {
-    cron(input: string, callback: () => void): () => void
+    cron(input: string, callback: () => void): () => void;
   }
 }
 
-class Task {
-  public timer: NodeJS.Timeout
+export interface Config { }
 
-  constructor(public ctx: Context, public expr: CronExpression, public callback: () => void) {
-    this.start()
+export const Config: Schema<Config> = Schema.object({});
+
+function formatLogValue(value: unknown) {
+  if (value instanceof Error) {
+    return value.stack ?? value.message;
   }
 
-  start() {
-    this.timer = setTimeout(async () => {
-      this.start()
+  if (typeof value === 'string') {
+    return value;
+  }
+
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function attachServiceOwner<T extends object>(value: T, owner: Context) {
+  if (!Reflect.getOwnPropertyDescriptor(value, Context.current)) {
+    Object.defineProperty(value, Context.current, {
+      value: owner,
+      configurable: true,
+    });
+  }
+
+  return value;
+}
+
+class CronTask {
+  private timer?: Disposable;
+  private disposed = false;
+
+  constructor(
+    private readonly caller: Context,
+    private readonly input: string,
+    private readonly expr: CronExpression,
+    private readonly callback: CronCallback,
+    private readonly logInfo: (...args: unknown[]) => void,
+  ) {
+    this.scheduleNext();
+  }
+
+  private scheduleNext() {
+    if (this.disposed) return;
+
+    const delay = Math.max(this.expr.next().getTime() - Date.now(), 0);
+    this.timer = this.caller.setTimeout(async () => {
+      this.timer = undefined;
+      if (this.disposed) return;
+
+      this.scheduleNext();
       try {
-        await this.callback()
+        await this.callback();
       } catch (error) {
-        this.ctx.logger('cron').warn(error)
+        this.logInfo('计划任务执行失败：', this.input, error);
       }
-    }, this.expr.next().getTime() - Date.now())
+    }, delay);
   }
 
-  stop() {
-    clearTimeout(this.timer)
+  dispose() {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.timer?.();
+    this.timer = undefined;
   }
 }
-
-export const name = 'cron'
-
-export interface Config {}
-
-export const Config: Schema<Config> = Schema.object({})
 
 export function apply(ctx: Context) {
-  ctx.provide('cron')
+  const logger = ctx.logger(name);
 
-  ctx.cron = function cron(this: Context, input: string, callback: () => void) {
-    const task = new Task(this, parseExpression(input), callback)
-    return this.collect('cron', () => task.stop())
+  function logInfo(...args: unknown[]) {
+    logger.info(args.map(formatLogValue).join(' '));
   }
+
+  function cronProxy(this: Context, input: string, callback: CronCallback) {
+    const caller = this ?? ctx;
+
+    const task = new CronTask(
+      caller,
+      input,
+      CronExpressionParser.parse(input),
+      callback,
+      logInfo,
+    );
+
+    return caller.effect(() => () => {
+      task.dispose();
+    });
+  }
+
+  attachServiceOwner(cronProxy, ctx);
+  ctx.set('cron', cronProxy);
 }
